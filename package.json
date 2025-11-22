@@ -1,0 +1,23 @@
+{
+  "name": "handcricket-functions-root",
+  "version": "1.0.0",
+  "description": "Root package for Hand Cricket Firebase Functions",
+  "private": true,
+  "scripts": {
+    "setup:local": "./scripts/env-setup.sh local",
+    "setup:staging": "./scripts/env-setup.sh staging",
+    "setup:prod": "./scripts/env-setup.sh prod",
+    "deploy:local": "./scripts/deploy.sh local",
+    "deploy:staging": "./scripts/deploy.sh staging",
+    "deploy:prod": "./scripts/deploy.sh prod",
+    "deploy:functions": "./scripts/deploy.sh staging functions",
+    "deploy:rules": "./scripts/deploy.sh staging rules",
+    "deploy:indexes": "./scripts/deploy.sh staging indexes",
+    "env:vars:local": "./scripts/set-env-vars.sh local",
+    "env:vars:staging": "./scripts/set-env-vars.sh staging",
+    "env:vars:prod": "./scripts/set-env-vars.sh prod",
+    "emulators": "cd functions && npm run serve",
+    "install": "cd functions && npm install"
+  }
+}
+

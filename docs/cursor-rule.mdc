@@ -1,0 +1,192 @@
+---
+alwaysApply: false
+---
+# Cursor Rule — Firestore / Realtime DB / Cloud Functions
+
+> **Single-sentence rule**: Always use **opaque, server-validated cursors** (base64 + HMAC) built from a stable ordering value + tie-breaker (doc id), include a short TTL and version, enforce per-page limits, and validate every cursor in your Cloud Function before using it to query the database.
+
+---
+
+## Why this file
+
+This `.mdc` contains the practical cursor rule, ready-to-paste JavaScript functions for creating/verifying cursors (for Cloud Functions), examples of using cursors with Firestore `startAfter`/`startAt`, Realtime Database notes, error handling patterns, and a recommended project structure that favors writing *only JavaScript* functions (no TypeScript).
+
+---
+
+## High-level guidelines
+
+1. **Order deterministically**: always `orderBy` on a stable field (e.g., `createdAt`) + tie-breaker `__name__` (doc id) to avoid duplicates.
+2. **Make cursors opaque**: package only the minimal state in JSON (`lastValue`, `docId`, `v`, `exp`), base64url-encode it and sign with HMAC-SHA256 using a server secret.
+3. **Validate server-side**: verify HMAC, version (`v`), and expiry (`exp`) in your Cloud Function before using the cursor.
+4. **Enforce limits**: max `limit` (e.g., 100), default `pageSize` (e.g., 20). Reject requests exceeding limits.
+5. **Stateless by default**: avoid storing cursor state server-side unless you need strong snapshot consistency.
+6. **Fail gracefully**: if a `startAfter` doc is deleted, fall back to `startAfter` on the last known field value or return a specific client-surfaceable error instructing a reset.
+7. **Log and monitor**: log invalid/expired cursor attempts to detect tampering.
+8. **Keep documentation current**: always update the documentation whenever any change is made inside `@docs` directory to ensure documentation reflects the current state of the codebase.
+
+---
+
+## Cursor JSON format (example)
+
+```json
+{
+  "lastValue": 1672531200000, // timestamp or sortable value
+  "docId": "abc123",
+  "v": 1,
+  "exp": 1710000000000
+}
+```
+
+Encode and sign as: `base64url(JSON) + '.' + base64url(HMAC_SHA256(base64url(JSON)))`.
+
+---
+
+## JavaScript helpers (Node / Cloud Functions)
+
+> These functions are written in **plain JavaScript** (CommonJS style) and intended to run in Cloud Functions or any Node server.
+
+The cursor utilities are implemented in `functions/utils/cursor.js`. See that file for the complete implementation with base64url encoding/decoding, HMAC signing, and verification.
+
+Key functions:
+- `signPayload(payload)` - Creates a signed cursor token from a payload
+- `verifyCursor(token)` - Verifies and decodes a cursor token
+
+---
+
+## Example Cloud Function (Firestore pagination)
+
+See `functions/index.js` for a complete example of cursor-based pagination with the `listItems` function. The implementation includes:
+
+- CORS handling
+- Page size validation and limits
+- Cursor verification with error handling
+- Fallback logic for deleted documents
+- Next cursor generation
+- Structured error responses
+
+Example usage:
+```
+GET /listItems?limit=20&cursor=<token>
+```
+
+Response:
+```json
+{
+  "items": [...],
+  "nextCursor": "token-string-or-null",
+  "hasMore": true
+}
+```
+
+---
+
+## Realtime Database notes
+
+* Use monotonic numeric keys or timestamps as ordering fields.
+* `startAt` / `startAfter` works with values; you may need to encode both value and key.
+* Because RTDB ordering is more value-oriented (less document-centric), ensure your cursor contains the exact value and the child key.
+
+---
+
+## Firestore Security Rules guidance
+
+* Security Rules cannot HMAC-verify client cursors. Always verify cursors inside trusted code (Cloud Function) before running queries.
+* In rules, require that client-supplied queries include the same filters you expect:
+
+  ```
+  allow list: if request.auth != null &&
+    request.query.orderBy('createdAt') &&
+    request.query.limit <= 100;
+  ```
+
+  (Note: Firestore rules syntax is limited; use server-side checks for complex validation.)
+
+See `infra/firestore.rules` for the current security rules implementation.
+
+---
+
+## Error handling and client contract
+
+* Responses shape: `{ items: [...], nextCursor: string|null, hasMore: boolean, error?:string }`.
+* If the `startAfter` doc is deleted and fallback fails, return `error: 'RESET_CURSOR'` or a 400-level and let client re-fetch from beginning.
+* Clients should treat cursors as opaque tokens and not try to decode them.
+
+---
+
+## Recommended project structure (JavaScript only)
+
+This project follows the recommended structure:
+
+```
+handcricket_functions/
+├─ functions/                    # Cloud Functions (JavaScript)
+│  ├─ package.json
+│  ├─ index.js                    # exports Cloud Functions
+│  ├─ utils/
+│  │  ├─ cursor.js                # sign/verify helpers (JS)
+│  │  └─ logger.js                # structured logging
+│  ├─ services/
+│  │  └─ firestore.js             # DB helper wrappers
+│  └─ config/                     # small JS config files reading env vars
+│      └─ index.js
+├─ infra/                         # infra-as-code / firebase.json etc
+│  ├─ firebase.json
+│  ├─ firestore.rules
+│  └─ firestore.indexes.json
+├─ docs/
+│  └─ cursor-rule.mdc             # this file
+└─ README.md
+```
+
+**package.json** (functions) minimal fields to prefer JavaScript runtime:
+
+```json
+{
+  "name": "handcricket-functions",
+  "engines": { "node": "18" },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "firebase-functions": "^4.5.0"
+  }
+}
+```
+
+---
+
+## Env vars (important)
+
+* `CURSOR_HMAC_SECRET` — required, random 32+ bytes
+  - Generate with: `openssl rand -base64 32`
+  - Must be set in environment for cursor operations to work
+* `DEFAULT_PAGE_SIZE` — optional, default: 20
+* `MAX_PAGE_SIZE` — optional, default: 100
+* `CURSOR_TTL_MS` — optional, default: 1800000 (30 minutes)
+* `NODE_OPTIONS` / runtime-specific settings as needed
+
+See `functions/config/index.js` for configuration management.
+
+---
+
+## Checklist before shipping
+
+* [ ] `CURSOR_HMAC_SECRET` created and stored in environment
+* [ ] Enforced `limit` max on server
+* [ ] Cursor TTL reasonable for app (minutes for news feed, hours for admin panels)
+* [ ] Logging of invalid cursor attempts
+* [ ] Tests: equal timestamps, deleted doc between pages, insert in middle
+* [ ] Firestore composite indexes deployed (see `infra/firestore.indexes.json`)
+* [ ] Security rules deployed and tested (see `infra/firestore.rules`)
+
+---
+
+## Quick troubleshooting
+
+* *Duplicate/skip items*: ensure `orderBy` includes tie-breaker document id.
+* *Cursor decode errors on client*: client must never decode; if they see decode errors, rotate secret and issue new cursors.
+* *Large page times out*: reduce `pageSize` or move heavy joins to async batch jobs.
+* *Invalid cursor errors*: check that `CURSOR_HMAC_SECRET` is set in environment variables.
+
+---
+
+*End of file.*

@@ -1,0 +1,255 @@
+---
+alwaysApply: false
+---
+# Cursor Rule — Firestore / Realtime DB / Cloud Functions
+
+> **Single-sentence rule**: Always use **opaque, server-validated cursors** (base64 + HMAC) built from a stable ordering value + tie-breaker (doc id), include a short TTL and version, enforce per-page limits, and validate every cursor in your Cloud Function before using it to query the database.
+
+---
+
+## Why this file
+
+This `.mdc` contains the practical cursor rule, ready-to-paste JavaScript functions for creating/verifying cursors (for Cloud Functions), examples of using cursors with Firestore `startAfter`/`startAt`, Realtime Database notes, error handling patterns, and a recommended project structure that favors writing *only JavaScript* functions (no TypeScript).
+
+---
+
+## High-level guidelines
+
+1. **Order deterministically**: always `orderBy` on a stable field (e.g., `createdAt`) + tie-breaker `__name__` (doc id) to avoid duplicates.
+2. **Make cursors opaque**: package only the minimal state in JSON (`lastValue`, `docId`, `v`, `exp`), base64url-encode it and sign with HMAC-SHA256 using a server secret.
+3. **Validate server-side**: verify HMAC, version (`v`), and expiry (`exp`) in your Cloud Function before using the cursor.
+4. **Enforce limits**: max `limit` (e.g., 100), default `pageSize` (e.g., 20). Reject requests exceeding limits.
+5. **Stateless by default**: avoid storing cursor state server-side unless you need strong snapshot consistency.
+6. **Fail gracefully**: if a `startAfter` doc is deleted, fall back to `startAfter` on the last known field value or return a specific client-surfaceable error instructing a reset.
+7. **Log and monitor**: log invalid/expired cursor attempts to detect tampering.
+8. **Keep documentation current**: always update the documentation whenever any change is made inside `@docs` to ensure documentation reflects the current state of the codebase.
+
+---
+
+## Cursor JSON format (example)
+
+```json
+{
+  "lastValue": 1672531200000, // timestamp or sortable value
+  "docId": "abc123",
+  "v": 1,
+  "exp": 1710000000000
+}
+```
+
+Encode and sign as: `base64url(JSON) + '.' + base64url(HMAC_SHA256(base64url(JSON)))`.
+
+---
+
+## JavaScript helpers (Node / Cloud Functions)
+
+> These functions are written in **plain JavaScript** (CommonJS style) and intended to run in Cloud Functions or any Node server.
+
+```js
+// utils/cursor.js
+const crypto = require('crypto');
+const SECRET = process.env.CURSOR_HMAC_SECRET; // required
+const HMAC_ALGO = 'sha256';
+
+function base64urlEncode(buf) {
+  return buf.toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function base64urlDecode(str) {
+  // restore padding
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  return Buffer.from(str, 'base64');
+}
+
+function signPayload(payload) {
+  if (!SECRET) throw new Error('CURSOR_HMAC_SECRET not set');
+  const json = JSON.stringify(payload);
+  const b64 = base64urlEncode(Buffer.from(json));
+  const hmac = crypto.createHmac(HMAC_ALGO, SECRET).update(b64).digest();
+  const sig = base64urlEncode(hmac);
+  return `${b64}.${sig}`;
+}
+
+function verifyCursor(token) {
+  if (!SECRET) throw new Error('CURSOR_HMAC_SECRET not set');
+  if (!token) throw new Error('Missing cursor');
+  const parts = token.split('.');
+  if (parts.length !== 2) throw new Error('Invalid cursor format');
+  const [b64, sig] = parts;
+  const expected = base64urlEncode(crypto.createHmac(HMAC_ALGO, SECRET).update(b64).digest());
+  // timing-safe compare
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) throw new Error('Invalid cursor signature');
+  const json = base64urlDecode(b64).toString();
+  const payload = JSON.parse(json);
+  if (payload.exp && Date.now() > payload.exp) throw new Error('Expired cursor');
+  if (!payload.v || payload.v !== 1) throw new Error('Unsupported cursor version');
+  if (!('lastValue' in payload) || !payload.docId) throw new Error('Malformed cursor payload');
+  return payload;
+}
+
+module.exports = { signPayload, verifyCursor };
+```
+
+---
+
+## Example Cloud Function (Firestore pagination)
+
+```js
+// functions/index.js (Cloud Functions)
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+admin.initializeApp();
+const db = admin.firestore();
+const { verifyCursor, signPayload } = require('./utils/cursor');
+
+exports.listPosts = functions.https.onRequest(async (req, res) => {
+  try {
+    const pageSize = Math.min(parseInt(req.query.limit || '20', 10), 100);
+    const cursorToken = req.query.cursor;
+    let q = db.collection('posts').orderBy('createdAt', 'desc').orderBy(admin.firestore.FieldPath.documentId(), 'desc').limit(pageSize + 1);
+
+    if (cursorToken) {
+      let payload;
+      try {
+        payload = verifyCursor(cursorToken);
+      } catch (err) {
+        return res.status(400).json({ error: 'Invalid or expired cursor' });
+      }
+      // If doc exists, prefer using document snapshot for strict ordering
+      try {
+        const snap = await db.collection('posts').doc(payload.docId).get();
+        if (snap.exists) {
+          q = q.startAfter(snap);
+        } else {
+          // fallback: startAfter using lastValue only
+          q = q.startAfter(payload.lastValue, payload.docId);
+        }
+      } catch (err) {
+        // fallback to field-based startAfter
+        q = q.startAfter(payload.lastValue, payload.docId);
+      }
+    }
+
+    const snaps = await q.get();
+    const docs = [];
+    snaps.forEach(d => docs.push({ id: d.id, ...d.data() }));
+
+    let nextCursor = null;
+    if (docs.length === pageSize + 1) {
+      const last = docs.pop();
+      const lastValue = last.createdAt instanceof admin.firestore.Timestamp ? last.createdAt.toMillis() : (last.createdAt || Date.now());
+      const payload = { lastValue, docId: last.id, v: 1, exp: Date.now() + 1000 * 60 * 30 };
+      nextCursor = signPayload(payload);
+    }
+
+    res.json({ items: docs, nextCursor, hasMore: !!nextCursor });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+```
+
+---
+
+## Realtime Database notes
+
+* Use monotonic numeric keys or timestamps as ordering fields.
+* `startAt` / `startAfter` works with values; you may need to encode both value and key.
+* Because RTDB ordering is more value-oriented (less document-centric), ensure your cursor contains the exact value and the child key.
+
+---
+
+## Firestore Security Rules guidance
+
+* Security Rules cannot HMAC-verify client cursors. Always verify cursors inside trusted code (Cloud Function) before running queries.
+* In rules, require that client-supplied queries include the same filters you expect:
+
+  ```
+  allow list: if request.auth != null &&
+    request.query.orderBy('createdAt') &&
+    request.query.limit <= 100;
+  ```
+
+  (Note: Firestore rules syntax is limited; use server-side checks for complex validation.)
+
+---
+
+## Error handling and client contract
+
+* Responses shape: `{ items: [...], nextCursor: string|null, hasMore: boolean, error?:string }`.
+* If the `startAfter` doc is deleted and fallback fails, return `error: 'RESET_CURSOR'` or a 400-level and let client re-fetch from beginning.
+* Clients should treat cursors as opaque tokens and not try to decode them.
+
+---
+
+## Recommended project structure (JavaScript only)
+
+```
+my-firebase-project/
+├─ functions/                    # Cloud Functions (JavaScript)
+│  ├─ package.json
+│  ├─ index.js                    # exports Cloud Functions
+│  ├─ utils/
+│  │  ├─ cursor.js                # sign/verify helpers (JS)
+│  │  └─ logger.js
+│  ├─ services/
+│  │  └─ firestore.js             # DB helper wrappers
+│  └─ config/                     # small JS config files reading env vars
+├─ web/                           # frontend (optional)
+│  └─ ...
+├─ infra/                         # infra-as-code / firebase.json etc
+│  └─ firebase.json
+├─ docs/
+│  └─ cursor-rule.mdc             # this file (copy here if you like)
+└─ README.md
+```
+
+**package.json** (functions) minimal fields to prefer JavaScript runtime:
+
+```json
+{
+  "name": "functions",
+  "engines": { "node": "18" },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "latest",
+    "firebase-functions": "latest"
+  }
+}
+```
+
+---
+
+## Env vars (important)
+
+* `CURSOR_HMAC_SECRET` — required, random 32+ bytes
+* `NODE_OPTIONS` / runtime-specific settings as needed
+
+---
+
+## Checklist before shipping
+
+* [ ] `CURSOR_HMAC_SECRET` created and stored in environment
+* [ ] Enforced `limit` max on server
+* [ ] Cursor TTL reasonable for app (minutes for news feed, hours for admin panels)
+* [ ] Logging of invalid cursor attempts
+* [ ] Tests: equal timestamps, deleted doc between pages, insert in middle
+
+---
+
+## Quick troubleshooting
+
+* *Duplicate/skip items*: ensure `orderBy` includes tie-breaker document id.
+* *Cursor decode errors on client*: client must never decode; if they see decode errors, rotate secret and issue new cursors.
+* *Large page times out*: reduce `pageSize` or move heavy joins to async batch jobs.
+
+---
+
+*End of file.*
