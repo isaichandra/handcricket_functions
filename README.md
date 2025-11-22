@@ -8,14 +8,20 @@ Firebase Cloud Functions and infrastructure for the Hand Cricket application.
 handcricket_functions/
 ├── functions/                    # Cloud Functions (JavaScript)
 │   ├── package.json
-│   ├── index.js                  # Main entry point for Cloud Functions
+│   ├── index.js                  # Main entry point (exports all functions)
+│   ├── functions/                # Individual function implementations
+│   │   ├── listItems.js          # List items with pagination
+│   │   ├── health.js             # Health check endpoint
+│   │   └── createNewUser.js  # Create user profile callable
 │   ├── utils/
 │   │   ├── cursor.js             # Cursor pagination utilities
 │   │   └── logger.js             # Logging utilities
 │   ├── services/
 │   │   └── firestore.js          # Firestore service layer
-│   └── config/
-│       └── index.js              # Configuration management (env-aware)
+│   ├── config/
+│   │   └── index.js              # Configuration management (env-aware)
+│   └── test/
+│       └── createNewUser.test.js  # Unit tests for createNewUser
 ├── infra/                        # Infrastructure configuration
 │   ├── firebase.json             # Firebase project configuration
 │   ├── firestore.rules           # Firestore security rules
@@ -305,6 +311,65 @@ Response:
 }
 ```
 
+### Create User Profile (Callable)
+
+```
+Callable: createNewUser
+```
+
+Creates a user profile with a unique username in Firebase Realtime Database.
+
+**Authentication:** Required (valid Firebase Auth token)
+
+**Request:**
+```json
+{
+  "username": "testuser123"
+}
+```
+
+**Username Rules:**
+- Minimum 8 characters, maximum 15 characters
+- Only lowercase letters, numbers, and underscores allowed
+- Cannot start with underscore (`_`) or a number
+- Must start with a lowercase letter
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "username": "testuser123",
+  "uid": "user-uid-here"
+}
+```
+
+**Error Responses:**
+- `unauthenticated` - Authentication required
+- `failed-precondition` - "use a verified email address to continue"
+- `invalid-argument` - "username rules failed" (if username validation fails)
+- `already-exists` - "user already exists" (if user profile already exists)
+- `already-exists` - "username already taken" (if username is already in use)
+- `internal` - "Something is wrong" or "Something is Wrong" (if creation fails after retries)
+
+**Behavior:**
+1. Validates authentication token
+2. Checks if email is verified
+3. Validates username format
+4. Checks if user profile already exists at `/users/{uid}`
+5. Checks if username is already taken at `/usernames/{username}`
+6. Creates username entry with retry logic (up to 3 attempts)
+7. Creates user profile with retry logic (up to 3 attempts with 0.5s delay)
+8. Automatically cleans up username entry if user creation fails
+
+**Database Structure:**
+- `/usernames/{username}` - Contains `created_at` timestamp
+- `/users/{uid}` - Contains `created_at`, `username`, and `email_address`
+
+**Implementation Details:**
+- Uses Firebase Realtime Database transactions for atomicity
+- Implements retry logic with exponential backoff for resilience
+- Automatically cleans up orphaned username entries on failure
+
 ## Cursor Pagination
 
 This project implements opaque, server-validated cursors for pagination. See `docs/cursor-rule.mdc` for detailed documentation.
@@ -319,6 +384,9 @@ Key features:
 
 - All cursors are validated server-side using HMAC signatures
 - Firestore security rules enforce authentication and authorization
+- Realtime Database security rules should be configured for `/users` and `/usernames` paths
+- All callable functions require authentication
+- Email verification is enforced for user profile creation
 - Environment variables are never exposed to clients
 - Cursor secrets should be rotated periodically
 
@@ -328,6 +396,12 @@ Key features:
 cd functions
 npm test
 ```
+
+Tests are located in `functions/test/` directory. The test suite includes:
+- Unit tests for `createNewUser` function
+- Authentication and authorization tests
+- Username validation tests
+- Retry logic and error handling tests
 
 ## Troubleshooting
 
@@ -364,6 +438,13 @@ npm run setup:staging
 - Ensure composite indexes are deployed for complex queries
 - Verify authentication is working correctly
 - Ensure you're using the correct Firebase project for your environment
+
+### Realtime Database Errors
+
+- Ensure Realtime Database is enabled in your Firebase project
+- Check Realtime Database security rules for `/users` and `/usernames` paths
+- Verify that transactions are properly configured
+- Check that the database URL is correctly configured in Firebase Admin initialization
 
 ### Deployment Issues
 

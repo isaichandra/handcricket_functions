@@ -8,6 +8,7 @@
   "main": "index.js",
   "scripts": {
     "lint": "eslint .",
+    "test": "mocha --timeout 10000",
     "serve": "firebase emulators:start --only functions",
     "shell": "firebase functions:shell",
     "start": "npm run shell",
@@ -29,7 +30,10 @@
   },
   "devDependencies": {
     "eslint": "^8.15.0",
-    "eslint-config-google": "^0.14.0"
+    "eslint-config-google": "^0.14.0",
+    "mocha": "^10.2.0",
+    "chai": "^4.3.10",
+    "sinon": "^17.0.1"
   },
   "private": true
 }
