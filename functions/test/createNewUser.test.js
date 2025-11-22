@@ -4,19 +4,8 @@
 
 const { expect } = require('chai');
 const sinon = require('sinon');
-const admin = require('firebase-admin');
+const proxyquire = require('proxyquire');
 const functions = require('firebase-functions');
-
-// Initialize Firebase Admin for testing (using test project or emulator)
-if (!admin.apps.length) {
-  admin.initializeApp({
-    projectId: 'test-project',
-    databaseURL: 'http://localhost:9000?ns=test-project'
-  });
-}
-
-// Import the function to test
-const createNewUser = require('../functions/createNewUser');
 
 describe('createNewUser', () => {
   let sandbox;
@@ -24,21 +13,16 @@ describe('createNewUser', () => {
   let databaseStub;
   let userRefStub;
   let usernameRefStub;
+  let createNewUserHandler;
+  let mockAdmin;
 
   beforeEach(() => {
     sandbox = sinon.createSandbox();
     
-    // Stub admin.auth()
+    // Create auth stub with getUser method
     authStub = {
       getUser: sandbox.stub()
     };
-    sandbox.stub(admin, 'auth').returns(authStub);
-
-    // Stub admin.database()
-    databaseStub = {
-      ref: sandbox.stub()
-    };
-    sandbox.stub(admin, 'database').returns(databaseStub);
 
     // Setup ref stubs
     userRefStub = {
@@ -51,8 +35,25 @@ describe('createNewUser', () => {
       remove: sandbox.stub()
     };
 
+    // Create database stub with ref method
+    databaseStub = {
+      ref: sandbox.stub()
+    };
     databaseStub.ref.withArgs(sinon.match(/^users\//)).returns(userRefStub);
     databaseStub.ref.withArgs(sinon.match(/^usernames\//)).returns(usernameRefStub);
+
+    // Create mock admin object
+    mockAdmin = {
+      auth: () => authStub,
+      database: () => databaseStub
+    };
+
+    // Use proxyquire to load the module with mocked firebase-admin
+    delete require.cache[require.resolve('../handlers/createNewUser')];
+    const createNewUser = proxyquire('../handlers/createNewUser', {
+      'firebase-admin': mockAdmin
+    });
+    createNewUserHandler = createNewUser.handler;
   });
 
   afterEach(() => {
@@ -61,11 +62,11 @@ describe('createNewUser', () => {
 
   describe('Authentication', () => {
     it('should throw error if user is not authenticated', async () => {
-      const context = { auth: null };
+      const context = { auth: null, app: {} };
       const data = { username: 'testuser123' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -74,11 +75,11 @@ describe('createNewUser', () => {
     });
 
     it('should throw error if uid is missing', async () => {
-      const context = { auth: {} };
+      const context = { auth: {}, app: {} };
       const data = { username: 'testuser123' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -90,7 +91,7 @@ describe('createNewUser', () => {
   describe('Email Verification', () => {
     it('should throw error if email is not verified', async () => {
       const uid = 'test-uid-123';
-      const context = { auth: { uid } };
+      const context = { auth: { uid }, app: {} };
       const data = { username: 'testuser123' };
 
       authStub.getUser.withArgs(uid).resolves({
@@ -100,7 +101,7 @@ describe('createNewUser', () => {
       });
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -112,7 +113,7 @@ describe('createNewUser', () => {
 
   describe('Username Validation', () => {
     const uid = 'test-uid-123';
-    const context = { auth: { uid } };
+    const context = { auth: { uid }, app: {} };
     
     beforeEach(() => {
       authStub.getUser.withArgs(uid).resolves({
@@ -129,7 +130,7 @@ describe('createNewUser', () => {
       const data = {};
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -141,7 +142,7 @@ describe('createNewUser', () => {
       const data = { username: 12345 };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -153,7 +154,7 @@ describe('createNewUser', () => {
       const data = { username: 'short' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -166,7 +167,7 @@ describe('createNewUser', () => {
       const data = { username: 'thisusernameistoolong' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -179,7 +180,7 @@ describe('createNewUser', () => {
       const data = { username: '_testuser' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -192,7 +193,7 @@ describe('createNewUser', () => {
       const data = { username: '123testuser' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -205,7 +206,7 @@ describe('createNewUser', () => {
       const data = { username: 'TestUser123' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -218,7 +219,7 @@ describe('createNewUser', () => {
       const data = { username: 'test-user' };
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -245,15 +246,14 @@ describe('createNewUser', () => {
         }
       });
 
-      const result = await createNewUser(data, context);
+      const result = await createNewUserHandler(data, context);
       expect(result.success).to.be.true;
-      expect(result.username).to.equal('testuser123');
     });
   });
 
   describe('User Existence Check', () => {
     const uid = 'test-uid-123';
-    const context = { auth: { uid } };
+    const context = { auth: { uid }, app: {} };
     const data = { username: 'testuser123' };
 
     beforeEach(() => {
@@ -270,7 +270,7 @@ describe('createNewUser', () => {
       });
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -282,7 +282,7 @@ describe('createNewUser', () => {
 
   describe('Username Existence Check', () => {
     const uid = 'test-uid-123';
-    const context = { auth: { uid } };
+    const context = { auth: { uid }, app: {} };
     const data = { username: 'testuser123' };
 
     beforeEach(() => {
@@ -302,19 +302,19 @@ describe('createNewUser', () => {
       });
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
         expect(error.code).to.equal('already-exists');
-        expect(error.message).to.equal('username already taken');
+        expect(error.message).to.equal('username testuser123 already taken');
       }
     });
   });
 
   describe('Successful Creation', () => {
     const uid = 'test-uid-123';
-    const context = { auth: { uid } };
+    const context = { auth: { uid }, app: {} };
     const data = { username: 'testuser123' };
     const email = 'test@example.com';
     const timestamp = 1234567890;
@@ -347,11 +347,9 @@ describe('createNewUser', () => {
         }
       });
 
-      const result = await createNewUser(data, context);
+      const result = await createNewUserHandler(data, context);
 
       expect(result.success).to.be.true;
-      expect(result.username).to.equal('testuser123');
-      expect(result.uid).to.equal(uid);
       expect(usernameRefStub.transaction.calledOnce).to.be.true;
       expect(userRefStub.transaction.calledOnce).to.be.true;
     });
@@ -373,7 +371,7 @@ describe('createNewUser', () => {
         });
       });
 
-      await createNewUser(data, context);
+      await createNewUserHandler(data, context);
 
       expect(capturedTimestamp).to.equal(timestamp);
     });
@@ -381,7 +379,7 @@ describe('createNewUser', () => {
 
   describe('Retry Logic', () => {
     const uid = 'test-uid-123';
-    const context = { auth: { uid } };
+    const context = { auth: { uid }, app: {} };
     const data = { username: 'testuser123' };
 
     beforeEach(() => {
@@ -412,7 +410,7 @@ describe('createNewUser', () => {
         snapshot: { val: () => ({}) }
       });
 
-      await createNewUser(data, context);
+      await createNewUserHandler(data, context);
 
       expect(usernameRefStub.transaction.calledTwice).to.be.true;
     });
@@ -421,7 +419,7 @@ describe('createNewUser', () => {
       usernameRefStub.transaction.resolves({ committed: false });
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -444,7 +442,7 @@ describe('createNewUser', () => {
           snapshot: { val: () => ({}) }
         });
 
-      await createNewUser(data, context);
+      await createNewUserHandler(data, context);
 
       expect(userRefStub.transaction.calledTwice).to.be.true;
     });
@@ -460,7 +458,7 @@ describe('createNewUser', () => {
       usernameRefStub.remove.resolves();
 
       try {
-        await createNewUser(data, context);
+        await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
@@ -470,4 +468,3 @@ describe('createNewUser', () => {
     });
   });
 });
-

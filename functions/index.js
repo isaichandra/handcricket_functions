@@ -2,7 +2,7 @@
  * Firebase Cloud Functions entry point
  * 
  * This file exports all Cloud Functions for the Hand Cricket application.
- * Individual functions are organized in separate files under the functions/ directory.
+ * Individual functions are organized in separate files under the handlers/ directory.
  */
 
 const admin = require('firebase-admin');
@@ -35,7 +35,7 @@ if (isEmulator) {
 }
 
 // Import and export all functions
-exports.listItems = require('./functions/listItems');
-exports.health = require('./functions/health');
-exports.createNewUser = require('./functions/createNewUser');
+exports.listItems = require('./handlers/listItems');
+exports.health = require('./handlers/health');
+exports.createNewUser = require('./handlers/createNewUser');
 

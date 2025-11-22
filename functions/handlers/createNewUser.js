@@ -16,7 +16,8 @@ const logger = require('../utils/logger');
 
 const rtdb = admin.database();
 
-module.exports = functions.https.onCall(async (data, context) => {
+// Export handler for testing
+const createNewUserHandler = async (data, context) => {
   try {
     // Step 1: Validate App Check token
     if (!context.app) {
@@ -103,7 +104,7 @@ module.exports = functions.https.onCall(async (data, context) => {
       logger.warn('Username already taken', { uid, username });
       throw new functions.https.HttpsError(
         'already-exists',
-        'username already taken'
+        `username ${username} already taken`
       );
     }
 
@@ -121,7 +122,7 @@ module.exports = functions.https.onCall(async (data, context) => {
             logger.warn('Username taken during retry', { uid, username, attempt });
             throw new functions.https.HttpsError(
               'already-exists',
-              'username already taken'
+              `username ${username} already taken`
             );
           }
         }
@@ -280,9 +281,7 @@ module.exports = functions.https.onCall(async (data, context) => {
 
     logger.info('User profile created successfully', { uid, username });
     return {
-      success: true,
-      username: username,
-      uid: uid
+      success: true
     };
 
   } catch (error) {
@@ -303,5 +302,11 @@ module.exports = functions.https.onCall(async (data, context) => {
       'An unexpected error occurred'
     );
   }
-});
+};
+
+// Export the callable function
+module.exports = functions.https.onCall(createNewUserHandler);
+
+// Export handler for testing
+module.exports.handler = createNewUserHandler;
 
