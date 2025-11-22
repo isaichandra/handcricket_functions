@@ -2,7 +2,7 @@
  * Create user profile with username
  * 
  * Callable function that creates a user profile with a unique username.
- * Validates auth, email verification, username format, and ensures uniqueness.
+ * Validates App Check, auth, email verification, username format, and ensures uniqueness.
  * 
  * @param {Object} data - Request data containing username
  * @param {string} data.username - Username (8-15 chars, lowercase/numbers/underscore, not starting with _ or number)
@@ -18,7 +18,16 @@ const rtdb = admin.database();
 
 module.exports = functions.https.onCall(async (data, context) => {
   try {
-    // Step 1: Validate auth token
+    // Step 1: Validate App Check token
+    if (!context.app) {
+      logger.warn('App Check token missing in createNewUser request');
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'App Check verification failed'
+      );
+    }
+
+    // Step 2: Validate auth token
     if (!context.auth || !context.auth.uid) {
       logger.warn('Unauthenticated request to createNewUser');
       throw new functions.https.HttpsError(
@@ -42,7 +51,7 @@ module.exports = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Step 2: Check if email is verified
+    // Step 3: Check if email is verified
     if (!userRecord.emailVerified) {
       logger.warn('Email not verified', { uid, email: userRecord.email });
       throw new functions.https.HttpsError(
@@ -62,7 +71,7 @@ module.exports = functions.https.onCall(async (data, context) => {
 
     const username = data.username.trim();
 
-    // Step 3: Validate username format
+    // Step 4: Validate username format
     // Rules:
     // - Min 8 chars, max 15 chars
     // - Only lowercase letters, numbers, and underscore
@@ -76,7 +85,7 @@ module.exports = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Step 4: Check if /users/{uid} exists
+    // Step 5: Check if /users/{uid} exists
     const userRef = rtdb.ref(`users/${uid}`);
     const userSnapshot = await userRef.once('value');
     if (userSnapshot.exists()) {
@@ -87,7 +96,7 @@ module.exports = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Step 5: Check if /usernames/{username} exists
+    // Step 6: Check if /usernames/{username} exists
     const usernameRef = rtdb.ref(`usernames/${username}`);
     let usernameSnapshot = await usernameRef.once('value');
     if (usernameSnapshot.exists()) {
@@ -98,7 +107,7 @@ module.exports = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Step 6: Create /usernames/{username} with transaction and retry
+    // Step 7: Create /usernames/{username} with transaction and retry
     let usernameCreated = false;
     let createdTimestamp = null;
     const maxRetries = 3;
@@ -175,7 +184,7 @@ module.exports = functions.https.onCall(async (data, context) => {
       );
     }
 
-    // Step 7: Create /users/{uid} with transaction and retry
+    // Step 8: Create /users/{uid} with transaction and retry
     let userCreated = false;
     const retryDelay = 500; // 0.5 seconds
 
@@ -223,7 +232,7 @@ module.exports = functions.https.onCall(async (data, context) => {
             attempts: maxRetries
           });
 
-          // Step 8: Cleanup - delete username if user creation failed
+          // Step 9: Cleanup - delete username if user creation failed
           try {
             await usernameRef.remove();
             logger.info('Cleaned up username after user creation failure', {
