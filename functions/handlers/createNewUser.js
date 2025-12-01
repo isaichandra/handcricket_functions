@@ -14,7 +14,17 @@ const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const logger = require('../utils/logger');
 
-const rtdb = admin.database();
+const db = admin.firestore();
+// Helper function to get serverTimestamp - use db.constructor.FieldValue for reliable access
+const getServerTimestamp = () => {
+  // Access FieldValue through the Firestore constructor (db.constructor.FieldValue)
+  // This is more reliable than admin.firestore.FieldValue in Cloud Functions runtime
+  const FieldValue = db.constructor.FieldValue;
+  if (!FieldValue) {
+    throw new Error('Firestore FieldValue is not available. Ensure admin is initialized.');
+  }
+  return FieldValue.serverTimestamp();
+};
 
 // Export handler for testing
 const createNewUserHandler = async (data, context) => {
@@ -86,10 +96,10 @@ const createNewUserHandler = async (data, context) => {
       );
     }
 
-    // Step 5: Check if /users/{uid} exists
-    const userRef = rtdb.ref(`users/${uid}`);
-    const userSnapshot = await userRef.once('value');
-    if (userSnapshot.exists()) {
+    // Step 5: Check if user document exists by uid
+    const userRef = db.collection('users').doc(uid);
+    const userDoc = await userRef.get();
+    if (userDoc.exists) {
       logger.warn('User already exists', { uid });
       throw new functions.https.HttpsError(
         'already-exists',
@@ -97,66 +107,69 @@ const createNewUserHandler = async (data, context) => {
       );
     }
 
-    // Step 6: Check if /usernames/{username} exists
-    const usernameRef = rtdb.ref(`usernames/${username}`);
-    let usernameSnapshot = await usernameRef.once('value');
-    if (usernameSnapshot.exists()) {
-      logger.warn('Username already taken', { uid, username });
-      throw new functions.https.HttpsError(
-        'already-exists',
-        `username ${username} already taken`
-      );
-    }
-
-    // Step 7: Create /usernames/{username} with transaction and retry
-    let usernameCreated = false;
-    let createdTimestamp = null;
+    // Step 6: Create user and username documents atomically using Firestore transaction
+    // We use a separate 'usernames' collection (document ID = username) to ensure
+    // atomic uniqueness checks, since Firestore transactions can read documents by ID
+    // but cannot perform queries
+    const usernameRef = db.collection('usernames').doc(username);
+    let userCreated = false;
     const maxRetries = 3;
+    const retryDelay = 500; // 0.5 seconds
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        // Re-check if username exists before retrying (except on first attempt)
+        // Wait before retry (except on first attempt)
         if (attempt > 1) {
-          usernameSnapshot = await usernameRef.once('value');
-          if (usernameSnapshot.exists()) {
-            logger.warn('Username taken during retry', { uid, username, attempt });
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        }
+
+        // Use Firestore transaction to atomically check and create both documents
+        // Get serverTimestamp sentinel before transaction (per Firebase Admin SDK docs)
+        // https://googleapis.dev/nodejs/firestore/latest/FieldValue.html#.serverTimestamp
+        const timestamp = getServerTimestamp();
+        
+        await db.runTransaction(async (transaction) => {
+          // Re-read user document to ensure it still doesn't exist
+          const userDocSnapshot = await transaction.get(userRef);
+          if (userDocSnapshot.exists) {
+            throw new Error('User already exists');
+          }
+
+          // Check if username is already taken by reading the username document
+          const usernameDocSnapshot = await transaction.get(usernameRef);
+          if (usernameDocSnapshot.exists) {
+            logger.warn('Username already taken in transaction', { uid, username });
             throw new functions.https.HttpsError(
               'already-exists',
               `username ${username} already taken`
             );
           }
-        }
 
-        // Attempt to create username using transaction
-        const usernameTransactionResult = await rtdb.ref(`usernames/${username}`).transaction((currentData) => {
-          if (currentData === null) {
-            // Path doesn't exist, we can create it
-            // Use ServerValue.TIMESTAMP if available, otherwise fallback to Date.now() for emulator
-            const ServerValue = admin.database && admin.database.ServerValue;
-            const timestamp = (ServerValue && ServerValue.TIMESTAMP) || Date.now();
-            return {
-              created_at: timestamp
-            };
-          }
-          // Path exists, abort transaction
-          return undefined;
+          // Both checks passed, create both documents atomically
+          // Create username document (for uniqueness tracking)
+          transaction.set(usernameRef, {
+            uid: uid,
+            created_at: timestamp
+          });
+
+          // Create user document
+          transaction.set(userRef, {
+            created_at: timestamp,
+            username: username,
+            email_address: userRecord.email
+          });
         });
 
-        // Check if transaction was committed
-        if (usernameTransactionResult.committed) {
-          usernameCreated = true;
-          createdTimestamp = usernameTransactionResult.snapshot.val().created_at;
-          logger.info('Username created successfully', { uid, username, attempt });
-          break;
-        } else {
-          throw new Error('Transaction aborted - username may have been taken');
-        }
+        userCreated = true;
+        logger.info('User created successfully', { uid, username, attempt });
+        break;
+
       } catch (error) {
         if (error instanceof functions.https.HttpsError) {
           throw error; // Re-throw HttpsError (like already-exists)
         }
         
-        logger.warn('Failed to create username', {
+        logger.warn('Failed to create user', {
           uid,
           username,
           attempt,
@@ -164,7 +177,7 @@ const createNewUserHandler = async (data, context) => {
         });
 
         if (attempt === maxRetries) {
-          logger.error('All retries failed for username creation', {
+          logger.error('All retries failed for user creation', {
             uid,
             username,
             attempts: maxRetries
@@ -178,104 +191,10 @@ const createNewUserHandler = async (data, context) => {
       }
     }
 
-    if (!usernameCreated) {
+    if (!userCreated) {
       throw new functions.https.HttpsError(
         'internal',
         'Something is wrong'
-      );
-    }
-
-    // Step 8: Create /users/{uid} with transaction and retry
-    let userCreated = false;
-    const retryDelay = 500; // 0.5 seconds
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        // Wait before retry (except on first attempt)
-        if (attempt > 1) {
-          await new Promise(resolve => setTimeout(resolve, retryDelay));
-        }
-
-        // Attempt to create user using transaction
-        const userTransactionResult = await rtdb.ref(`users/${uid}`).transaction((currentData) => {
-          if (currentData === null) {
-            // Path doesn't exist, we can create it
-            return {
-              created_at: createdTimestamp,
-              username: username,
-              email_address: userRecord.email
-            };
-          }
-          // Path exists, abort transaction
-          return undefined;
-        });
-
-        // Check if transaction was committed
-        if (userTransactionResult.committed) {
-          userCreated = true;
-          logger.info('User created successfully', { uid, username, attempt });
-          break;
-        } else {
-          throw new Error('Transaction aborted - user may already exist');
-        }
-      } catch (error) {
-        logger.warn('Failed to create user', {
-          uid,
-          username,
-          attempt,
-          error: error.message
-        });
-
-        if (attempt === maxRetries) {
-          logger.error('All retries failed for user creation, cleaning up username', {
-            uid,
-            username,
-            attempts: maxRetries
-          });
-
-          // Step 9: Cleanup - delete username if user creation failed
-          try {
-            await usernameRef.remove();
-            logger.info('Cleaned up username after user creation failure', {
-              uid,
-              username
-            });
-          } catch (cleanupError) {
-            logger.error('Failed to cleanup username', {
-              uid,
-              username,
-              error: cleanupError.message
-            });
-          }
-
-          throw new functions.https.HttpsError(
-            'internal',
-            'Something is Wrong'
-          );
-        }
-        // Continue to next retry
-      }
-    }
-
-    if (!userCreated) {
-      // Final cleanup attempt
-      try {
-        await usernameRef.remove();
-        logger.info('Cleaned up username after user creation failure (final)', {
-          uid,
-          username
-        });
-      } catch (cleanupError) {
-        logger.error('Failed to cleanup username (final)', {
-          uid,
-          username,
-          error: cleanupError.message
-        });
-      }
-
-      throw new functions.https.HttpsError(
-        'internal',
-        'Something is Wrong'
       );
     }
 
