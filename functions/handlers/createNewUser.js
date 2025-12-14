@@ -13,63 +13,22 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const logger = require('../utils/logger');
+const { validateAuthAndEmail } = require('../utils/auth');
+const { getServerTimestamp } = require('../utils/firestore');
 
 const db = admin.firestore();
-// Helper function to get serverTimestamp - use db.constructor.FieldValue for reliable access
-const getServerTimestamp = () => {
-  // Access FieldValue through the Firestore constructor (db.constructor.FieldValue)
-  // This is more reliable than admin.firestore.FieldValue in Cloud Functions runtime
-  const FieldValue = db.constructor.FieldValue;
-  if (!FieldValue) {
-    throw new Error('Firestore FieldValue is not available. Ensure admin is initialized.');
-  }
-  return FieldValue.serverTimestamp();
-};
 
 // Export handler for testing
 const createNewUserHandler = async (data, context) => {
   try {
-    // Step 1: Validate App Check token
-    if (!context.app) {
-      logger.warn('App Check token missing in createNewUser request');
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'App Check verification failed'
-      );
-    }
-
-    // Step 2: Validate auth token
-    if (!context.auth || !context.auth.uid) {
-      logger.warn('Unauthenticated request to createNewUser');
-      throw new functions.https.HttpsError(
-        'unauthenticated',
-        'Authentication required'
-      );
-    }
-
+    // Validate App Check, auth, and email verification
+    await validateAuthAndEmail(context, 'createNewUser');
+    
     const uid = context.auth.uid;
     logger.debug('createNewUser called', { uid, username: data?.username });
 
-    // Get user record to check email verification
-    let userRecord;
-    try {
-      userRecord = await admin.auth().getUser(uid);
-    } catch (error) {
-      logger.error('Error getting user record', { uid, error: error.message });
-      throw new functions.https.HttpsError(
-        'internal',
-        'Failed to retrieve user information'
-      );
-    }
-
-    // Step 3: Check if email is verified
-    if (!userRecord.emailVerified) {
-      logger.warn('Email not verified', { uid, email: userRecord.email });
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'use a verified email address to continue'
-      );
-    }
+    // Get user record for email address
+    const userRecord = await admin.auth().getUser(uid);
 
     // Validate username input
     if (!data || typeof data.username !== 'string') {

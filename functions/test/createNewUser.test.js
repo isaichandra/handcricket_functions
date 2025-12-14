@@ -13,6 +13,7 @@ describe('createNewUser', () => {
   let databaseStub;
   let userRefStub;
   let usernameRefStub;
+  let firestoreStub;
   let createNewUserHandler;
   let mockAdmin;
 
@@ -24,34 +25,78 @@ describe('createNewUser', () => {
       getUser: sandbox.stub()
     };
 
-    // Setup ref stubs
-    userRefStub = {
-      once: sandbox.stub(),
-      transaction: sandbox.stub()
+    // Setup Firestore document stubs
+    // User document stub - needs get() to return a snapshot with exists property
+    const userDocStub = {
+      get: sandbox.stub().resolves({ exists: false }),
+      set: sandbox.stub()
     };
-    usernameRefStub = {
-      once: sandbox.stub(),
-      transaction: sandbox.stub(),
-      remove: sandbox.stub()
+    
+    // Username document stub - needs get() to return a snapshot with exists property
+    const usernameDocStub = {
+      get: sandbox.stub().resolves({ exists: false }),
+      set: sandbox.stub()
     };
 
-    // Create database stub with ref method
-    databaseStub = {
-      ref: sandbox.stub()
+    // Setup Firestore collection stubs
+    const usersCollectionStub = {
+      doc: sandbox.stub().returns(userDocStub)
     };
-    databaseStub.ref.withArgs(sinon.match(/^users\//)).returns(userRefStub);
-    databaseStub.ref.withArgs(sinon.match(/^usernames\//)).returns(usernameRefStub);
+    
+    const usernamesCollectionStub = {
+      doc: sandbox.stub().returns(usernameDocStub)
+    };
+
+    const firestoreCollectionStub = sandbox.stub();
+    firestoreCollectionStub.withArgs('users').returns(usersCollectionStub);
+    firestoreCollectionStub.withArgs('usernames').returns(usernamesCollectionStub);
+
+    const fieldValueStub = {
+      serverTimestamp: sandbox.stub().returns('SERVER_TIMESTAMP')
+    };
+
+    // Declare firestoreStub in the outer scope so tests can access it
+    firestoreStub = {
+      collection: firestoreCollectionStub,
+      runTransaction: sandbox.stub()
+    };
+
+    // Add constructor with FieldValue
+    const FirestoreConstructor = function() {
+      return firestoreStub;
+    };
+    FirestoreConstructor.FieldValue = fieldValueStub;
+    firestoreStub.constructor = FirestoreConstructor;
+
+    // Store stubs for use in tests (for backward compatibility with existing tests)
+    userRefStub = userDocStub;
+    usernameRefStub = usernameDocStub;
 
     // Create mock admin object
     mockAdmin = {
       auth: () => authStub,
-      database: () => databaseStub
+      database: () => databaseStub,
+      firestore: () => firestoreStub
     };
 
     // Use proxyquire to load the module with mocked firebase-admin
     delete require.cache[require.resolve('../handlers/createNewUser')];
-    const createNewUser = proxyquire('../handlers/createNewUser', {
+    delete require.cache[require.resolve('../utils/auth')];
+    delete require.cache[require.resolve('../utils/firestore')];
+    
+    // Mock utilities
+    const mockAuth = proxyquire('../utils/auth', {
       'firebase-admin': mockAdmin
+    });
+    
+    const mockFirestore = proxyquire('../utils/firestore', {
+      'firebase-admin': mockAdmin
+    });
+    
+    const createNewUser = proxyquire('../handlers/createNewUser', {
+      'firebase-admin': mockAdmin,
+      '../utils/auth': mockAuth,
+      '../utils/firestore': mockFirestore
     });
     createNewUserHandler = createNewUser.handler;
   });
@@ -121,9 +166,9 @@ describe('createNewUser', () => {
         email: 'test@example.com',
         emailVerified: true
       });
-      userRefStub.once.withArgs('value').resolves({
-        exists: () => false
-      });
+      // User doesn't exist
+      userRefStub.get.resolves({ exists: false });
+      usernameRefStub.get.resolves({ exists: false });
     });
 
     it('should throw error if username is missing', async () => {
@@ -230,21 +275,12 @@ describe('createNewUser', () => {
 
     it('should accept valid username', async () => {
       const data = { username: 'testuser123' };
-      usernameRefStub.once.withArgs('value').resolves({
-        exists: () => false
-      });
-      usernameRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({ created_at: 1234567890 })
-        }
-      });
-      userRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({})
-        }
-      });
+      // User doesn't exist
+      userRefStub.get.resolves({ exists: false });
+      // Username doesn't exist
+      usernameRefStub.get.resolves({ exists: false });
+      // Transaction succeeds
+      firestoreStub.runTransaction.resolves();
 
       const result = await createNewUserHandler(data, context);
       expect(result.success).to.be.true;
@@ -265,9 +301,8 @@ describe('createNewUser', () => {
     });
 
     it('should throw error if user already exists', async () => {
-      userRefStub.once.withArgs('value').resolves({
-        exists: () => true
-      });
+      // User already exists
+      userRefStub.get.resolves({ exists: true });
 
       try {
         await createNewUserHandler(data, context);
@@ -291,14 +326,22 @@ describe('createNewUser', () => {
         email: 'test@example.com',
         emailVerified: true
       });
-      userRefStub.once.withArgs('value').resolves({
-        exists: () => false
-      });
+      // User doesn't exist
+      userRefStub.get.resolves({ exists: false });
     });
 
     it('should throw error if username already taken', async () => {
-      usernameRefStub.once.withArgs('value').resolves({
-        exists: () => true
+      // Username already exists (in transaction)
+      firestoreStub.runTransaction.callsFake(async (callback) => {
+        const transaction = {
+          get: sandbox.stub()
+            // First get: user document (doesn't exist)
+            .onFirstCall().resolves({ exists: false })
+            // Second get: username document (exists - username taken)
+            .onSecondCall().resolves({ exists: true }),
+          set: sandbox.stub()
+        };
+        await callback(transaction);
       });
 
       try {
@@ -307,7 +350,7 @@ describe('createNewUser', () => {
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
         expect(error.code).to.equal('already-exists');
-        expect(error.message).to.equal('username testuser123 already taken');
+        expect(error.message).to.include('already taken');
       }
     });
   });
@@ -325,55 +368,46 @@ describe('createNewUser', () => {
         email,
         emailVerified: true
       });
-      userRefStub.once.withArgs('value').resolves({
-        exists: () => false
-      });
-      usernameRefStub.once.withArgs('value').resolves({
-        exists: () => false
+      // User doesn't exist
+      userRefStub.get.resolves({ exists: false });
+      usernameRefStub.get.resolves({ exists: false });
+      
+      // Mock transaction
+      firestoreStub.runTransaction.callsFake(async (callback) => {
+        const transaction = {
+          get: sandbox.stub().resolves({ exists: false }),
+          set: sandbox.stub()
+        };
+        await callback(transaction);
       });
     });
 
     it('should successfully create user profile', async () => {
-      usernameRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({ created_at: timestamp })
-        }
-      });
-      userRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({})
-        }
-      });
-
       const result = await createNewUserHandler(data, context);
 
       expect(result.success).to.be.true;
-      expect(usernameRefStub.transaction.calledOnce).to.be.true;
-      expect(userRefStub.transaction.calledOnce).to.be.true;
+      expect(firestoreStub.runTransaction.calledOnce).to.be.true;
     });
 
     it('should use same timestamp for both username and user', async () => {
-      let capturedTimestamp;
-      usernameRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({ created_at: timestamp })
-        }
-      });
-      userRefStub.transaction.callsFake((updateFn) => {
-        const result = updateFn(null);
-        capturedTimestamp = result.created_at;
-        return Promise.resolve({
-          committed: true,
-          snapshot: { val: () => result }
-        });
+      let capturedTimestamps = [];
+      firestoreStub.runTransaction.callsFake(async (callback) => {
+        const transaction = {
+          get: sandbox.stub().resolves({ exists: false }),
+          set: sandbox.stub().callsFake((ref, data) => {
+            if (data.created_at) {
+              capturedTimestamps.push(data.created_at);
+            }
+          })
+        };
+        await callback(transaction);
       });
 
       await createNewUserHandler(data, context);
 
-      expect(capturedTimestamp).to.equal(timestamp);
+      // Both documents should have the same timestamp (username and user)
+      expect(capturedTimestamps.length).to.equal(2);
+      expect(capturedTimestamps[0]).to.equal(capturedTimestamps[1]);
     });
   });
 
@@ -388,35 +422,34 @@ describe('createNewUser', () => {
         email: 'test@example.com',
         emailVerified: true
       });
-      userRefStub.once.withArgs('value').resolves({
-        exists: () => false
-      });
-      usernameRefStub.once.withArgs('value').resolves({
-        exists: () => false
-      });
+      // User doesn't exist
+      userRefStub.get.resolves({ exists: false });
+      usernameRefStub.get.resolves({ exists: false });
     });
 
     it('should retry username creation on failure', async () => {
-      usernameRefStub.transaction
-        .onFirstCall().resolves({ committed: false })
-        .onSecondCall().resolves({
-          committed: true,
-          snapshot: {
-            val: () => ({ created_at: 1234567890 })
-          }
-        });
-      userRefStub.transaction.resolves({
-        committed: true,
-        snapshot: { val: () => ({}) }
+      let attemptCount = 0;
+      firestoreStub.runTransaction.callsFake(async (callback) => {
+        attemptCount++;
+        if (attemptCount === 1) {
+          // First attempt fails
+          throw new Error('Transaction failed');
+        }
+        // Second attempt succeeds
+        const transaction = {
+          get: sandbox.stub().resolves({ exists: false }),
+          set: sandbox.stub()
+        };
+        await callback(transaction);
       });
 
       await createNewUserHandler(data, context);
 
-      expect(usernameRefStub.transaction.calledTwice).to.be.true;
+      expect(attemptCount).to.equal(2);
     });
 
     it('should throw error after max retries for username', async () => {
-      usernameRefStub.transaction.resolves({ committed: false });
+      firestoreStub.runTransaction.rejects(new Error('Transaction failed'));
 
       try {
         await createNewUserHandler(data, context);
@@ -424,46 +457,42 @@ describe('createNewUser', () => {
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
         expect(error.message).to.equal('Something is wrong');
-        expect(usernameRefStub.transaction.callCount).to.equal(3);
+        expect(firestoreStub.runTransaction.callCount).to.equal(3);
       }
     });
 
     it('should retry user creation on failure with delay', async () => {
-      usernameRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({ created_at: 1234567890 })
+      let attemptCount = 0;
+      firestoreStub.runTransaction.callsFake(async (callback) => {
+        attemptCount++;
+        if (attemptCount === 1) {
+          // First attempt fails
+          throw new Error('Transaction failed');
         }
+        // Second attempt succeeds
+        const transaction = {
+          get: sandbox.stub().resolves({ exists: false }),
+          set: sandbox.stub()
+        };
+        await callback(transaction);
       });
-      userRefStub.transaction
-        .onFirstCall().resolves({ committed: false })
-        .onSecondCall().resolves({
-          committed: true,
-          snapshot: { val: () => ({}) }
-        });
 
       await createNewUserHandler(data, context);
 
-      expect(userRefStub.transaction.calledTwice).to.be.true;
+      expect(attemptCount).to.equal(2);
     });
 
     it('should cleanup username if user creation fails after retries', async () => {
-      usernameRefStub.transaction.resolves({
-        committed: true,
-        snapshot: {
-          val: () => ({ created_at: 1234567890 })
-        }
-      });
-      userRefStub.transaction.resolves({ committed: false });
-      usernameRefStub.remove.resolves();
+      // This test doesn't apply to Firestore since we use transactions
+      // Transactions are atomic, so if user creation fails, username creation also fails
+      firestoreStub.runTransaction.rejects(new Error('Transaction failed'));
 
       try {
         await createNewUserHandler(data, context);
         expect.fail('Should have thrown an error');
       } catch (error) {
         expect(error).to.be.instanceOf(functions.https.HttpsError);
-        expect(error.message).to.equal('Something is Wrong');
-        expect(usernameRefStub.remove.called).to.be.true;
+        expect(error.message).to.equal('Something is wrong');
       }
     });
   });

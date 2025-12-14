@@ -38,4 +38,6 @@ if (isEmulator) {
 exports.listItems = require('./handlers/listItems');
 exports.health = require('./handlers/health');
 exports.createNewUser = require('./handlers/createNewUser');
+exports.quickMatch = require('./handlers/quickMatch');
+exports.cancelQuickMatch = require('./handlers/cancelQuickMatch');
 

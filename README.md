@@ -12,7 +12,9 @@ handcricket_functions/
 │   ├── functions/                # Individual function implementations
 │   │   ├── listItems.js          # List items with pagination
 │   │   ├── health.js             # Health check endpoint
-│   │   └── createNewUser.js  # Create user profile callable
+│   │   ├── createNewUser.js      # Create user profile callable
+│   │   ├── quickMatch.js         # Quick matchmaking callable
+│   │   └── cancelQuickMatch.js   # Cancel quick match callable
 │   ├── utils/
 │   │   ├── cursor.js             # Cursor pagination utilities
 │   │   └── logger.js             # Logging utilities
@@ -21,7 +23,8 @@ handcricket_functions/
 │   ├── config/
 │   │   └── index.js              # Configuration management (env-aware)
 │   └── test/
-│       └── createNewUser.test.js  # Unit tests for createNewUser
+│       ├── createNewUser.test.js  # Unit tests for createNewUser
+│       └── quickMatch.test.js     # Unit tests for quickMatch
 ├── infra/                        # Infrastructure configuration
 │   ├── firebase.json             # Firebase project configuration
 │   ├── firestore.rules           # Firestore security rules
@@ -370,6 +373,105 @@ Creates a user profile with a unique username in Firebase Realtime Database.
 - Implements retry logic with exponential backoff for resilience
 - Automatically cleans up orphaned username entries on failure
 
+### Quick Match (Callable)
+
+```
+Callable: quickMatch
+```
+
+Adds a user to the quick matchmaking queue if they are online and not already waiting.
+
+**Authentication:** Required (valid Firebase Auth token)
+
+**Request:**
+```json
+{}
+```
+
+No request data is required. The user's UID is extracted from the authentication context.
+
+**Response (Success):**
+```json
+{
+  "success": true
+}
+```
+
+**Error Responses:**
+- `unauthenticated` - Authentication required
+- `failed-precondition` - "use a verified email address to continue"
+- `failed-precondition` - "User Not Online" (if user is not present in Realtime Database)
+- `already-exists` - "User Already Waiting to be matched" (if user is already in the queue)
+- `internal` - "An unexpected error occurred" (for unexpected errors)
+
+**Behavior:**
+1. Validates authentication token and App Check
+2. Checks if email is verified
+3. Checks if user is online by verifying `presence/{uid}` exists in Realtime Database
+4. Checks if user is already waiting in the `quick_matchmaking_queue` collection
+5. Creates a document in `quick_matchmaking_queue` with:
+   - `uid`: User's UID (document ID)
+   - `created_at`: Server timestamp
+   - `status`: "waiting"
+
+**Database Structure:**
+- **Realtime Database:** `/presence/{uid}` - User presence indicator
+- **Firestore:** `quick_matchmaking_queue/{uid}` - Queue document with:
+  - `uid`: User's UID
+  - `created_at`: Server timestamp
+  - `status`: "waiting"
+
+**Implementation Details:**
+- Uses Realtime Database to check user online status
+- Uses Firestore for queue management
+- Document ID in queue collection is the user's UID for efficient lookups
+
+### Cancel Quick Match (Callable)
+
+```
+Callable: cancelQuickMatch
+```
+
+Removes a user from the quick matchmaking queue if present.
+
+**Authentication:** Required (valid Firebase Auth token)
+
+**Request:**
+```json
+{}
+```
+
+No request data is required. The user's UID is extracted from the authentication context.
+
+**Response (Success):**
+```json
+{
+  "success": true
+}
+```
+
+**Error Responses:**
+- `unauthenticated` - Authentication required
+- `failed-precondition` - "use a verified email address to continue"
+- `internal` - "An unexpected error occurred" (for unexpected errors)
+
+**Behavior:**
+1. Validates authentication token and App Check
+2. Checks if email is verified
+3. Attempts to delete the document `{uid}` from the `quick_matchmaking_queue` collection
+4. If the document is locked (transaction conflict or contention), retries up to 10 times with a 0.5 second delay between attempts
+5. Returns success regardless of whether the document was successfully removed or not
+
+**Database Structure:**
+- **Firestore:** `quick_matchmaking_queue/{uid}` - Queue document to be deleted
+
+**Implementation Details:**
+- Uses Firestore for queue management
+- Implements retry logic with 0.5s delay for locked documents (up to 10 retries)
+- Handles locked document errors (`aborted`, `failed-precondition`, `unavailable`)
+- Always returns success, even if deletion fails after all retries
+- If document doesn't exist, operation is considered successful
+
 ## Cursor Pagination
 
 This project implements opaque, server-validated cursors for pagination. See `docs/cursor-rule.mdc` for detailed documentation.
@@ -399,9 +501,15 @@ npm test
 
 Tests are located in `functions/test/` directory. The test suite includes:
 - Unit tests for `createNewUser` function
+- Unit tests for `quickMatch` function
+- Unit tests for `cancelQuickMatch` function
 - Authentication and authorization tests
+- Email verification tests
 - Username validation tests
 - Retry logic and error handling tests
+- User online status checks
+- Queue existence validation tests
+- Document deletion with retry logic tests
 
 ## Troubleshooting
 
